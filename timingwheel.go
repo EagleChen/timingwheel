@@ -8,9 +8,8 @@ import (
 )
 
 const (
-	defaultWheelSize   = 20
-	defaultTickMS      = 1
-	defaultWorkBufSize = 100
+	defaultWheelSize = 20
+	defaultTickMS    = 1
 
 	maxLevel = 7
 )
@@ -24,7 +23,6 @@ type TimingWheel struct {
 	buckets     []TimerTaskList
 	baseWheel   *TimingWheel
 
-	workChan chan func()
 	stopChan chan struct{}
 
 	overflowWheel unsafe.Pointer // *TimingWheel, but may be nil
@@ -32,15 +30,15 @@ type TimingWheel struct {
 
 // NewTimingWheel creates a timingwheel with default config
 func NewTimingWheel() TimingWheel {
-	return NewTimingWheelWithConfig(defaultWheelSize, defaultTickMS, defaultWorkBufSize)
+	return NewTimingWheelWithConfig(defaultWheelSize, defaultTickMS)
 }
 
-func NewTimingWheelWithConfig(wheelSize int64, tickMS int64, workBufSize int) TimingWheel {
-	return NewTimingWheelWithConfigWithBaseWheel(defaultWheelSize, defaultTickMS, defaultWorkBufSize, 0, nil)
+func NewTimingWheelWithConfig(wheelSize int64, tickMS int64) TimingWheel {
+	return NewTimingWheelWithConfigWithBaseWheel(defaultWheelSize, defaultTickMS, 0, nil)
 }
 
 // NewTimingWheelWithConfig creates a timingwheel with customized config
-func NewTimingWheelWithConfigWithBaseWheel(wheelSize int64, tickMS int64, workBufSize int,
+func NewTimingWheelWithConfigWithBaseWheel(wheelSize int64, tickMS int64,
 	level uint8, baseWheel *TimingWheel) TimingWheel {
 	timeMS := time.Now().UnixNano() / 1000
 
@@ -49,14 +47,13 @@ func NewTimingWheelWithConfigWithBaseWheel(wheelSize int64, tickMS int64, workBu
 		tickMS:      tickMS,
 		interval:    tickMS * wheelSize,
 		currentTime: timeMS - (timeMS % tickMS),
+		level:       level,
 	}
 
 	if baseWheel == nil { // tw is base timingwheel
 		baseWheel = &tw
-		tw.workChan = make(chan func(), workBufSize)
 		tw.stopChan = make(chan struct{})
 	} else {
-		tw.workChan = baseWheel.workChan
 		tw.stopChan = baseWheel.stopChan
 	}
 
@@ -78,7 +75,7 @@ func (tw *TimingWheel) addOverflowTimingWheel() error {
 	// no need to use mutex here
 	wheel := atomic.LoadPointer(&tw.overflowWheel)
 	if wheel == nil {
-		timingWheel := NewTimingWheelWithConfigWithBaseWheel(tw.wheelSize, tw.interval, 0,
+		timingWheel := NewTimingWheelWithConfigWithBaseWheel(tw.wheelSize, tw.interval,
 			tw.level+1, tw.baseWheel)
 		atomic.CompareAndSwapPointer(&tw.overflowWheel, nil, unsafe.Pointer(&timingWheel))
 	}
@@ -108,8 +105,8 @@ func (tw *TimingWheel) Add(expiration int64, action func()) error {
 
 func (tw *TimingWheel) add(entry *TimerTaskEntry) error {
 	if entry.expiration < tw.currentTime+tw.tickMS { // fire now
-		// dispatch action
-		tw.workChan <- entry.action
+		// TODO: dispatch action
+		go func() { entry.action() }()
 	} else if entry.expiration < tw.currentTime+tw.interval { // add to current wheel
 		actualIdx := (entry.expiration / tw.tickMS) % tw.wheelSize
 		tw.buckets[actualIdx].add(entry)
@@ -126,4 +123,14 @@ func (tw *TimingWheel) add(entry *TimerTaskEntry) error {
 	}
 
 	return nil
+}
+
+func (tw *TimingWheel) stop() {
+	if wheel := atomic.LoadPointer(&tw.overflowWheel); wheel != nil {
+		(*TimingWheel)(wheel).stop()
+	}
+
+	for i := range tw.buckets {
+		tw.buckets[i].stop()
+	}
 }

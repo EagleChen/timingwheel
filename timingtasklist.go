@@ -11,6 +11,7 @@ type TimerTaskList struct {
 	tail *TimerTaskEntry
 
 	taskTimer *time.Timer
+	stopChan  chan struct{}
 }
 
 func newTimerTaskList(tw *TimingWheel) TimerTaskList {
@@ -31,7 +32,7 @@ func newTimerTaskList(tw *TimingWheel) TimerTaskList {
 			select {
 			case <-timer.C:
 				bucket.drain(tw)
-			case <-tw.stopChan:
+			case <-bucket.stopChan:
 				if !timer.Stop() {
 					<-timer.C
 				}
@@ -70,4 +71,9 @@ func (l *TimerTaskList) drain(baseWheel *TimingWheel) {
 		baseWheel.add(l.head)
 		l.head = l.head.next
 	}
+	l.tail = nil // reset tail
+}
+
+func (l *TimerTaskList) stop() {
+	l.stopChan <- struct{}{}
 }
