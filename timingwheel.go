@@ -7,12 +7,7 @@ import (
 	"unsafe"
 )
 
-const (
-	defaultWheelSize = 20
-	defaultTickMS    = 1
-
-	maxLevel = 7
-)
+const maxLevel = 7
 
 type TimingWheel struct {
 	level       uint8
@@ -20,12 +15,11 @@ type TimingWheel struct {
 	tickMS      int64
 	interval    int64
 	currentTime int64
-	buckets     []TimerTaskList
-	baseWheel   *TimingWheel
-
-	stopChan chan struct{}
+	buckets     []*TimerTaskList
 
 	overflowWheel unsafe.Pointer // *TimingWheel, but may be nil
+
+	wheelTimer *WheelTimer
 }
 
 // NewTimingWheel creates a timingwheel with default config
@@ -34,13 +28,13 @@ func NewTimingWheel() TimingWheel {
 }
 
 func NewTimingWheelWithConfig(wheelSize int64, tickMS int64) TimingWheel {
-	return NewTimingWheelWithConfigWithBaseWheel(defaultWheelSize, defaultTickMS, 0, nil)
+	return newTimingWheelWithConfigWithTimer(wheelSize, defaultTickMS, 0, nil)
 }
 
 // NewTimingWheelWithConfig creates a timingwheel with customized config
-func NewTimingWheelWithConfigWithBaseWheel(wheelSize int64, tickMS int64,
-	level uint8, baseWheel *TimingWheel) TimingWheel {
-	timeMS := time.Now().UnixNano() / 1000
+func newTimingWheelWithConfigWithTimer(wheelSize int64, tickMS int64,
+	level uint8, wheelTimer *WheelTimer) TimingWheel {
+	timeMS := time.Now().UnixNano() / 1000000
 
 	tw := TimingWheel{
 		wheelSize:   wheelSize,
@@ -48,42 +42,22 @@ func NewTimingWheelWithConfigWithBaseWheel(wheelSize int64, tickMS int64,
 		interval:    tickMS * wheelSize,
 		currentTime: timeMS - (timeMS % tickMS),
 		level:       level,
+		wheelTimer:  wheelTimer,
 	}
 
-	if baseWheel == nil { // tw is base timingwheel
-		baseWheel = &tw
-		tw.stopChan = make(chan struct{})
-	} else {
-		tw.stopChan = baseWheel.stopChan
-	}
-
-	tw.baseWheel = baseWheel
-	buckets := make([]TimerTaskList, wheelSize)
+	buckets := make([]*TimerTaskList, wheelSize)
 	for i := range buckets {
-		buckets[i] = newTimerTaskList(baseWheel)
+		idx := int(level)*int(wheelSize) + i
+		buckets[i] = newTimerTaskList(idx)
+		if level != 0 {
+			buckets[i].start(wheelTimer)
+		}
 	}
 	tw.buckets = buckets
 
 	return tw
 }
 
-func (tw *TimingWheel) addOverflowTimingWheel() error {
-	if tw.level+1 >= maxLevel {
-		return errors.New("too many levels of timing wheel")
-	}
-
-	// no need to use mutex here
-	wheel := atomic.LoadPointer(&tw.overflowWheel)
-	if wheel == nil {
-		timingWheel := NewTimingWheelWithConfigWithBaseWheel(tw.wheelSize, tw.interval,
-			tw.level+1, tw.baseWheel)
-		atomic.CompareAndSwapPointer(&tw.overflowWheel, nil, unsafe.Pointer(&timingWheel))
-	}
-
-	return nil
-}
-
-// TODO: no race issue?
 func (tw *TimingWheel) advanceClock(timeMS int64) {
 	// for high level wheel, this `if` may often be false
 	if timeMS >= tw.currentTime+tw.tickMS {
@@ -96,30 +70,26 @@ func (tw *TimingWheel) advanceClock(timeMS int64) {
 	}
 }
 
-// Add adds timer task entry to timing wheel or executes the entry
-// expiration in milli seconds
-func (tw *TimingWheel) Add(expiration int64, action func()) error {
-	entry := TimerTaskEntry{expiration: expiration, action: action}
-	return tw.add(&entry)
-}
-
-func (tw *TimingWheel) add(entry *TimerTaskEntry) error {
+func (tw *TimingWheel) addEntry(entry *TimerTaskEntry) error {
 	if entry.expiration < tw.currentTime+tw.tickMS { // fire now
 		// TODO: dispatch action
-		go func() { entry.action() }()
+		go entry.action()
 	} else if entry.expiration < tw.currentTime+tw.interval { // add to current wheel
 		actualIdx := (entry.expiration / tw.tickMS) % tw.wheelSize
-		tw.buckets[actualIdx].add(entry)
+		tw.buckets[actualIdx].add(entry, tw.tickMS)
 	} else { // add to higher level wheel
+		if tw.level+1 >= maxLevel {
+			return errors.New("too many levels of timing wheel")
+		}
 		wheel := atomic.LoadPointer(&tw.overflowWheel)
 		if wheel == nil {
-			if err := tw.addOverflowTimingWheel(); err != nil {
-				return err
-			}
+			timingWheel := newTimingWheelWithConfigWithTimer(tw.wheelSize, tw.interval,
+				tw.level+1, tw.wheelTimer)
+			atomic.CompareAndSwapPointer(&tw.overflowWheel, nil, unsafe.Pointer(&timingWheel))
 			wheel = atomic.LoadPointer(&tw.overflowWheel)
 		}
 
-		(*TimingWheel)(wheel).add(entry)
+		(*TimingWheel)(wheel).addEntry(entry)
 	}
 
 	return nil

@@ -6,15 +6,18 @@ import (
 )
 
 type TimerTaskList struct {
-	mu   *sync.Mutex
-	head *TimerTaskEntry
-	tail *TimerTaskEntry
+	mu         *sync.Mutex
+	head       *TimerTaskEntry
+	tail       *TimerTaskEntry
+	expiration int64 // milliseconds
 
-	taskTimer *time.Timer
-	stopChan  chan struct{}
+	idx         int
+	taskTimer   *time.Timer
+	timerSetted bool
+	stopChan    chan struct{}
 }
 
-func newTimerTaskList(tw *TimingWheel) TimerTaskList {
+func newTimerTaskList(idx int) *TimerTaskList {
 	timer := time.NewTimer(time.Hour)
 	// create and stop
 	if !timer.Stop() {
@@ -23,28 +26,33 @@ func newTimerTaskList(tw *TimingWheel) TimerTaskList {
 
 	var mu sync.Mutex
 	bucket := TimerTaskList{
-		taskTimer: timer,
-		mu:        &mu,
+		idx:         idx,
+		taskTimer:   timer,
+		mu:          &mu,
+		stopChan:    make(chan struct{}),
+		timerSetted: false,
 	}
 
-	go func() {
-		for {
-			select {
-			case <-timer.C:
-				bucket.drain(tw)
-			case <-bucket.stopChan:
-				if !timer.Stop() {
-					<-timer.C
-				}
-				return
-			}
-		}
-	}()
+	// go func() {
+	// 	for {
+	// 		select {
+	// 		case <-timer.C:
+	// 			bucket.drain(tw)
+	// 		case <-bucket.stopChan:
+	// 			bucket.mu.Lock()
+	// 			defer bucket.mu.Unlock()
+	// 			if !timer.Stop() {
+	// 				<-timer.C
+	// 			}
+	// 			return
+	// 		}
+	// 	}
+	// }()
 
-	return bucket
+	return &bucket
 }
 
-func (l *TimerTaskList) add(entry *TimerTaskEntry) {
+func (l *TimerTaskList) add(entry *TimerTaskEntry, wheelTickMS int64) {
 	if entry == nil {
 		return
 	}
@@ -56,7 +64,10 @@ func (l *TimerTaskList) add(entry *TimerTaskEntry) {
 		l.head = entry
 		l.tail = entry
 		// wait for the timer to trigger
-		l.taskTimer.Reset(time.Duration(entry.expiration-time.Now().UnixNano()/1000) * time.Millisecond)
+		l.expiration = entry.expiration - entry.expiration%wheelTickMS
+		d := time.Duration(l.expiration - time.Now().UnixNano()/1000000)
+		l.taskTimer.Reset(d * time.Millisecond)
+		l.timerSetted = true
 	} else {
 		l.tail.next = entry
 		l.tail = entry
@@ -68,12 +79,35 @@ func (l *TimerTaskList) drain(baseWheel *TimingWheel) {
 	defer l.mu.Unlock()
 
 	for l.head != nil {
-		baseWheel.add(l.head)
+		baseWheel.addEntry(l.head)
 		l.head = l.head.next
 	}
 	l.tail = nil // reset tail
+	l.timerSetted = false
+}
+
+func (l *TimerTaskList) start(w *WheelTimer) {
+	go func() {
+		w.waitGroup.Add(1)
+		for {
+			select {
+			case <-l.taskTimer.C:
+				w.drainBucketChan <- l
+			case <-l.stopChan:
+				l.mu.Lock()
+				defer l.mu.Unlock()
+				if !l.taskTimer.Stop() && l.timerSetted {
+					<-l.taskTimer.C
+				}
+				w.waitGroup.Done()
+				return
+			}
+		}
+	}()
 }
 
 func (l *TimerTaskList) stop() {
-	l.stopChan <- struct{}{}
+	if l.stopChan != nil {
+		close(l.stopChan)
+	}
 }
