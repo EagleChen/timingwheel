@@ -9,6 +9,9 @@ import (
 
 const maxLevel = 7
 
+// TimingWheel is an implementation of Hierarchical Timing Wheels.
+// When lots of timers(about 1m) need to be maintained, use TimingWheel.
+// Or else, just use timers
 type TimingWheel struct {
 	level       uint8
 	wheelSize   int64
@@ -22,16 +25,16 @@ type TimingWheel struct {
 	wheelTimer *WheelTimer
 }
 
-// NewTimingWheel creates a timingwheel with default config
-func NewTimingWheel() TimingWheel {
-	return NewTimingWheelWithConfig(defaultWheelSize, defaultTickMS)
+// newTimingWheel creates a timingwheel with default config
+func newTimingWheel() TimingWheel {
+	return newTimingWheelWithConfig(defaultWheelSize, defaultTickMS)
 }
 
-func NewTimingWheelWithConfig(wheelSize int64, tickMS int64) TimingWheel {
+func newTimingWheelWithConfig(wheelSize int64, tickMS int64) TimingWheel {
 	return newTimingWheelWithConfigWithTimer(wheelSize, defaultTickMS, 0, nil)
 }
 
-// NewTimingWheelWithConfig creates a timingwheel with customized config
+// newTimingWheelWithConfig creates a timingwheel with customized config
 func newTimingWheelWithConfigWithTimer(wheelSize int64, tickMS int64,
 	level uint8, wheelTimer *WheelTimer) TimingWheel {
 	timeMS := time.Now().UnixNano() / 1000000
@@ -89,7 +92,7 @@ func (tw *TimingWheel) addEntry(entry *TimerTaskEntry) error {
 			wheel = atomic.LoadPointer(&tw.overflowWheel)
 		}
 
-		(*TimingWheel)(wheel).addEntry(entry)
+		return (*TimingWheel)(wheel).addEntry(entry)
 	}
 
 	return nil

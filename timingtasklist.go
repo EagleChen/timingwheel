@@ -32,23 +32,6 @@ func newTimerTaskList(idx int) *TimerTaskList {
 		stopChan:    make(chan struct{}),
 		timerSetted: false,
 	}
-
-	// go func() {
-	// 	for {
-	// 		select {
-	// 		case <-timer.C:
-	// 			bucket.drain(tw)
-	// 		case <-bucket.stopChan:
-	// 			bucket.mu.Lock()
-	// 			defer bucket.mu.Unlock()
-	// 			if !timer.Stop() {
-	// 				<-timer.C
-	// 			}
-	// 			return
-	// 		}
-	// 	}
-	// }()
-
 	return &bucket
 }
 
@@ -74,16 +57,18 @@ func (l *TimerTaskList) add(entry *TimerTaskEntry, wheelTickMS int64) {
 	}
 }
 
-func (l *TimerTaskList) drain(baseWheel *TimingWheel) {
+// drain only returns head and reset itself
+// it should not block too long
+func (l *TimerTaskList) drain() *TimerTaskEntry {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
-	for l.head != nil {
-		baseWheel.addEntry(l.head)
-		l.head = l.head.next
+	head := l.head
+	if l.head != nil {
+		l.head = nil
+		l.tail = nil // reset tail
+		// l.timerSetted = false // the value changed in the task timer goroutine below
 	}
-	l.tail = nil // reset tail
-	l.timerSetted = false
+	return head
 }
 
 func (l *TimerTaskList) start(w *WheelTimer) {
@@ -92,12 +77,17 @@ func (l *TimerTaskList) start(w *WheelTimer) {
 		for {
 			select {
 			case <-l.taskTimer.C:
-				w.drainBucketChan <- l
+				w.updateClockChan <- l
+				l.mu.Lock()
+				l.timerSetted = false
+				l.mu.Unlock()
 			case <-l.stopChan:
 				l.mu.Lock()
 				defer l.mu.Unlock()
-				if !l.taskTimer.Stop() && l.timerSetted {
-					<-l.taskTimer.C
+				if !l.taskTimer.Stop() {
+					if l.timerSetted {
+						<-l.taskTimer.C
+					}
 				}
 				w.waitGroup.Done()
 				return
