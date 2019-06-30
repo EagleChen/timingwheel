@@ -25,6 +25,9 @@ type WheelTimer struct {
 	stopDrainingChan chan struct{}
 
 	drainBuckets []*TimerTaskEntry
+
+	pool     *sync.Pool
+	stopping bool
 }
 
 // NewWheelTimer creates a WheelTimer with default configs.
@@ -45,6 +48,11 @@ func NewWheelTimerWithConfig(wheelSize int64, tickMS int64) *WheelTimer {
 		drainBucketChan:  make(chan []*TimerTaskEntry, defaultChanBuffer),
 		stopClockChan:    make(chan struct{}),
 		stopDrainingChan: make(chan struct{}),
+		pool: &sync.Pool{
+			New: func() interface{} {
+				return new(TimerTaskEntry)
+			},
+		},
 	}
 
 	w.wheel.wheelTimer = &w
@@ -53,6 +61,7 @@ func NewWheelTimerWithConfig(wheelSize int64, tickMS int64) *WheelTimer {
 
 // Start starts the wheel timer.
 func (w *WheelTimer) Start() error {
+	w.stopping = false
 	go func() { // handle 'advance clock'
 		w.waitGroup.Add(1)
 		for {
@@ -107,9 +116,17 @@ func (w *WheelTimer) Start() error {
 			select {
 			case heads := <-w.drainBucketChan:
 				for _, head := range heads {
+					current := head
 					for head != nil {
 						w.addEntry(head) // important: use read lock
 						head = head.next
+					}
+
+					for current != nil {
+						next := current.next
+						current.next = nil // must reset before put back to pool
+						w.pool.Put(current)
+						current = next
 					}
 				}
 			case <-w.stopDrainingChan:
@@ -128,6 +145,9 @@ func (w *WheelTimer) Start() error {
 
 // Stop stops the wheel timer. Once stopped, it should not be started again.
 func (w *WheelTimer) Stop() {
+	w.clockLock.Lock()
+	w.stopping = true
+	w.clockLock.Unlock()
 	w.wheel.stop()
 	w.stopClockChan <- struct{}{}
 	w.stopDrainingChan <- struct{}{}
@@ -137,24 +157,32 @@ func (w *WheelTimer) Stop() {
 // Add adds timer task entry to timing wheel or executes the entry
 // expiration in milli seconds
 func (w *WheelTimer) Add(expiration int64, action func()) error {
+	// entry := TimerTaskEntry{expiration: expiration, action: action}
+	// return w.wheel.addEntry(&entry)
 	w.clockLock.RLock()
 	defer w.clockLock.RUnlock()
-	entry := TimerTaskEntry{expiration: expiration, action: action}
-	return w.wheel.addEntry(&entry)
+	entry := w.pool.Get().(*TimerTaskEntry)
+	entry.expiration = expiration
+	entry.action = action
+
+	return w.wheel.addEntry(entry, w.stopping)
 }
 
 // After adds timer task entry to timing wheel or executes the entry
 // expiration is now + afterMS
 func (w *WheelTimer) After(afterMS int64, action func()) error {
+	// entry := TimerTaskEntry{expiration: time.Now().UnixNano()/1000000 + afterMS, action: action}
+	// return w.wheel.addEntry(&entry)
 	w.clockLock.RLock()
 	defer w.clockLock.RUnlock()
-
-	entry := TimerTaskEntry{expiration: time.Now().UnixNano()/1000000 + afterMS, action: action}
-	return w.wheel.addEntry(&entry)
+	entry := w.pool.Get().(*TimerTaskEntry)
+	entry.expiration = time.Now().UnixNano()/1000000 + afterMS
+	entry.action = action
+	return w.wheel.addEntry(entry, w.stopping)
 }
 
 func (w *WheelTimer) addEntry(entry *TimerTaskEntry) error {
 	w.clockLock.RLock()
 	defer w.clockLock.RUnlock()
-	return w.wheel.addEntry(entry)
+	return w.wheel.addEntry(entry, w.stopping)
 }

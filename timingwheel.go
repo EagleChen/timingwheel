@@ -73,7 +73,7 @@ func (tw *TimingWheel) advanceClock(timeMS int64) {
 	}
 }
 
-func (tw *TimingWheel) addEntry(entry *TimerTaskEntry) error {
+func (tw *TimingWheel) addEntry(entry *TimerTaskEntry, stopping bool) error {
 	if entry.expiration < tw.currentTime+tw.tickMS { // fire now
 		// TODO: dispatch action
 		go entry.action()
@@ -86,13 +86,16 @@ func (tw *TimingWheel) addEntry(entry *TimerTaskEntry) error {
 		}
 		wheel := atomic.LoadPointer(&tw.overflowWheel)
 		if wheel == nil {
+			if stopping {
+				return errors.New("stopping, no more task in higher level")
+			}
 			timingWheel := newTimingWheelWithConfigWithTimer(tw.wheelSize, tw.interval,
 				tw.level+1, tw.wheelTimer)
 			atomic.CompareAndSwapPointer(&tw.overflowWheel, nil, unsafe.Pointer(&timingWheel))
 			wheel = atomic.LoadPointer(&tw.overflowWheel)
 		}
 
-		return (*TimingWheel)(wheel).addEntry(entry)
+		return (*TimingWheel)(wheel).addEntry(entry, stopping)
 	}
 
 	return nil
